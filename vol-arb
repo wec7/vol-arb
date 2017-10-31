@@ -1,0 +1,684 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 1. Introduction \n",
+    "\n",
+    "This ipython notebook is to explain how to do volatility arbitrage (in the format of plain English + formulas + toy simulations + charts). The main time-consuming component is the simulations, as free option data is hardly accessible publicly. And this is also a learning process for me, so I just followed wiki's scheme on volatility arbitrage, and add my research + implementation."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/Users/weiyichen/anaconda3/lib/python3.6/site-packages/statsmodels/compat/pandas.py:56: FutureWarning: The pandas.core.datetools module is deprecated and will be removed in a future version. Please use the pandas.tseries module instead.\n",
+      "  from pandas.core import datetools\n"
+     ]
+    }
+   ],
+   "source": [
+    "import datetime\n",
+    "import functools\n",
+    "from   ipywidgets import interact\n",
+    "import ipywidgets as widgets\n",
+    "from   lazy import lazy\n",
+    "import matplotlib.pyplot as plt\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import pandas_datareader.data as web\n",
+    "import quandl\n",
+    "from   singleton_decorator import singleton\n",
+    "import statsmodels.tsa.stattools as ts \n",
+    "\n",
+    "%matplotlib inline \n",
+    "plt.style.use('ggplot')\n",
+    "quandl.ApiConfig.api_key = \"uqysokLyGSFVL-x6tzEM\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Volatility arbitrage is a type of statistical arbitrage that is implemented by trading a **delta neutral portfolio of an option and its underlying**. The objective is to take advantage of differences between the **implied volatility** of the option, and a forecast of future **realized volatility** of the option's underlying. Volatility rather than price is used as the unit of relative measure.\n",
+    "\n",
+    "So volatility arbitrage basically means **buying undervalued options and selling over-valued options**.\n",
+    "\n",
+    "<img src=\"Payoff of Vol-arb.png\" width=600>"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 2. Databases: Quandl\n",
+    "\n",
+    "Quandl is a platform for financial, economic, and alternative data that serves investment professionals. All Quandl's data are accessible via a Python API. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "UNIVERSE = ['MSFT', 'AAPL', 'YHOO'] # only free sample OPT data\n",
+    "START = datetime.date(2010, 1, 1)\n",
+    "\n",
+    "@singleton\n",
+    "class DB(object):\n",
+    "    \n",
+    "    @functools.lru_cache(maxsize=None)\n",
+    "    def quandl_get(self, *args, **kwargs):\n",
+    "        kwargs['start_date'] = START\n",
+    "        return quandl.get(*args, **kwargs)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### 2.1 EOD Databse\n",
+    "\n",
+    "Professional-grade EOD stock prices, dividends, adjustments and splits for publicly-traded US stocks. Updated daily. History to 1996. Quotemedia data."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "9f39e2d763f54a82b865604cca8e0f1d",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "A Jupyter Widget"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/plain": [
+       "<function __main__.<lambda>>"
+      ]
+     },
+     "execution_count": 3,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "interact(lambda ticker=UNIVERSE: DB().quandl_get('EOD/'+ticker).tail())"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### 2.2 OPT Database\n",
+    "\n",
+    "Updated daily, the ORATS professional grade database of implied and historical volatility information covers all US equity options.\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "23fb3540c65941659b1ff738fcef0238",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "A Jupyter Widget"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/plain": [
+       "<function __main__.<lambda>>"
+      ]
+     },
+     "execution_count": 4,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "interact(lambda ticker=UNIVERSE: DB().quandl_get('OPT/'+ticker).tail())"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Data definition per column can be found at https://www.quandl.com/data/OPT-ORATS-Option-Volatility-Surfaces/documentation/data-organization."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 3. Overview\n",
+    "\n",
+    "If a trader **buys options** as part of a delta-neutral portfolio, he is said to be **long volatility**. If he **sells options**, he is said to be **short volatility**. So long as the trading is done delta-neutral, buying an option is a bet that the underlying's future realized volatility will be high, while selling an option is a bet that future realized volatility will be low. Because of the put–call parity, **it doesn't matter if the options traded are calls or puts.**\n",
+    "\n",
+    "Volatility arbitrage is not \"true economic arbitrage\" (in the sense of a risk free profit opportunity). It relies on predicting the future direction of implied volatility.*\n",
+    "\n",
+    "<img src='http://ciberconta.unizar.es/bolsa/derivados1/lvol.gif'>"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 4. Forecast (realized) Volatility \n",
+    "\n",
+    "To engage in volatility arbitrage, a trader must first forecast the underlying's future realized volatility. This is typically done by **computing the historical daily returns for the underlying for a given past sample** such as 252 days. The trader may also use other factors, such as whether the period was unusually volatile, or if there are going to be unusual events in the near future, to adjust his forecast."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "class Asset_HV(object):\n",
+    "    \n",
+    "    def __init__(self, **kwargs):\n",
+    "        for key, value in kwargs.items():\n",
+    "            setattr(self, key, value)\n",
+    "            \n",
+    "    @lazy\n",
+    "    def Ticker(self):\n",
+    "        return None\n",
+    "            \n",
+    "    @lazy\n",
+    "    def StockPx(self):\n",
+    "        return DB().quandl_get('EOD/%s'%self.Ticker).Adj_Close.rename('StockPx')\n",
+    "         \n",
+    "    @lazy\n",
+    "    def Window(self):\n",
+    "        return 252\n",
+    "    \n",
+    "    @lazy\n",
+    "    def HistoricalVol(self):\n",
+    "        return (self.StockPx.pct_change().rolling(self.Window).std() * (252 ** .5)).rename('%s_HV'%self.Window)\n",
+    "    \n",
+    "    def plot(self):\n",
+    "        pd.concat([self.StockPx, self.HistoricalVol], 1).plot(figsize=(20, 10), secondary_y='StockPx')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "59012cd78ad24b56928e821ee808cfb9",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "A Jupyter Widget"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/plain": [
+       "<function __main__.<lambda>>"
+      ]
+     },
+     "execution_count": 6,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "interact(lambda ticker=UNIVERSE: Asset_HV(Ticker=ticker).plot())"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 5. Implied (market) volatility\n",
+    "\n",
+    "In practice, the only two inputs to the option model that change during the day are **the price of the underlying and the volatility**. Therefore, the theoretical price of an option can be expressed as:\n",
+    "\n",
+    "$$ {\\displaystyle C=f(S,\\sigma ,\\cdot )\\,} $$\n",
+    "\n",
+    "where ${\\displaystyle S\\,}$ is the price of the underlying, and ${\\displaystyle \\sigma \\,}$ is the estimate of future volatility. Because the theoretical price function ${\\displaystyle f()\\,}$ is a monotonically increasing function of ${\\displaystyle \\sigma \\,}$, there must be a corresponding monotonically increasing function ${\\displaystyle g()\\,}$ that expresses **the volatility implied by the option's market price ${\\displaystyle {\\bar {C}}\\,}$ **\n",
+    "\n",
+    "$${\\displaystyle \\sigma _{\\bar {C}}=g(S,{\\bar {C}},\\cdot )\\,} $$\n",
+    "\n",
+    "Because implied volatility of an option can remain constant even as the underlying's value changes, traders use it as a measure of relative value rather than the option's market price.\n",
+    "\n",
+    "Unfortunately there is no historical option price data publicly, so even though it is easy to implement $g()$ assuming $f()$ is the BS model. But fortunately, quandl **OPT Database** provides interpolated implied volatility data. And it also provides historical close-to-close and tick volatility data, we will Quandl's as that might be more reliable. (Actually Quandl uses a different methodology to compute historical volatility, which makes more sense with example proof, but we are not getting into details here.)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "class Asset_IV(Asset_HV):\n",
+    "    \n",
+    "    @lazy\n",
+    "    def Window(self):\n",
+    "        return 60\n",
+    "    \n",
+    "    @lazy\n",
+    "    def HistoricalVol(self):\n",
+    "        return DB().quandl_get('OPT/%s'%self.Ticker)['%sdORHV'%self.Window]\n",
+    "    \n",
+    "    @lazy\n",
+    "    def ImpliedVol(self):\n",
+    "        return DB().quandl_get('OPT/%s'%self.Ticker)['iv%s'%self.Window]\n",
+    "    \n",
+    "    def plot(self):\n",
+    "        pd.concat([self.StockPx, self.HistoricalVol, self.ImpliedVol], 1).plot(figsize=(20, 10), secondary_y='StockPx')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "0395be7f554c44c2afef7036f0a7b1dd",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "A Jupyter Widget"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/plain": [
+       "<function __main__.<lambda>>"
+      ]
+     },
+     "execution_count": 8,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "interact(lambda ticker=UNIVERSE: Asset_IV(Ticker=ticker).plot())"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 6. Mechanism\n",
+    "\n",
+    "A trader looks for options where the implied volatility, ${\\displaystyle \\sigma _{\\bar {C}}\\,}$, is either significantly lower than or higher than the forecast realized volatility ${\\displaystyle \\sigma \\,}$, for the underlying. In the first case, the trader **buys the option and hedges with the underlying to make a delta neutral portfolio**. In the second case, the trader sells the option and then hedges the position. Over the holding period, the trader will realize a profit on the trade if the underlying's realized volatility is closer to his forecast than it is to the market's forecast (i.e. the implied volatility). \n",
+    "\n",
+    "<img src='https://zerodha.com/varsity/wp-content/uploads/2015/06/Image-1_Delta-vs-Spot3.png' width=400>\n",
+    "\n",
+    "#### 6.1 Drawbacks\n",
+    "\n",
+    "Since the delta of an option changes as the price of the underlying asset changes over time, a portfolio consisting of an option and its underlying asset that is initially delta-neutral will soon no longer be so. \n",
+    "\n",
+    "At this point, the performance of the portfolio is no longer based solely on volatility of the underlying asset but also on the performance of the underlying asset. This can be prevented by continuous delta hedging, or rebalancing of the portfolio to ensure that it is delta neutral. However, this not only creates **transaction costs**, but also it is not feasible for traders as they **cannot constantly alter their hedge**. Thus the position will generally not be solely dependent on volatility and is therefore not an ideal means of trading volatility."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### 6.2 Variance Swap\n",
+    "\n",
+    "An alternative to options-based volatility trading is to use variance swaps. In\n",
+    "a variance swap, **one leg is valued based on the realised variance (volatility squared) of the underlying asset**, as measured by logarithmic returns, while **the other leg, the strike, is set at the inception of the swap and is based on the squared amount of the implied volatility of the underlying asset** at the time the swap is struck.\n",
+    "\n",
+    "The strike price of the swap is determined by the implied volatility of the options currently traded in the market based on the underlying asset. Thus a variance swap position is equivalent to a portfolio of options on the underlying asset and can be hedged in such a manner.\n",
+    "\n",
+    "<img src='https://www.assetmacro.com/wp-content/uploads/2015/06/Variance-Swap.png'>\n",
+    "\n",
+    "A long variance swap position will profit if the realised variance of the underlying asset is greater than the implied variance at the time the swap is struck. A variance swap provides pure exposure to volatility, as, unlike options prices, its value is based solely on changes to volatility.\n",
+    "\n",
+    "**The payoff of a variance swap is equal to the difference between realized variance and implied variance, multiplied by the number of contract units.** The number of contract units is set such that if the realised volatility is one volatility point above the strike, the payoff to the receiver of realised volatility will be equal to the notional value of the contract."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### 6.3 Notes\n",
+    "\n",
+    "An interesting characteristic of volatility is that for most traded assets, **implied volatility tends to be higher than actual realised volatility**. This is due to the fact that options are often used as a hedge or insurance, and options writers will only be willing to write options if they can expect a sufficient profit to compensate for the risks they are assuming. Thus, options and options-based structures such as variance swaps will tend to be priced at a higher implied volatility than is actually expected to be realised.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### 6.4 Variance Swap Price\n",
+    "\n",
+    "The ideal way to simulate is to follow the below scheme:\n",
+    "\n",
+    "    - Generate forecasted realized volatility time series, based on the underlying historical price data (done)\n",
+    "    - Generate implied volatility time series, based on the options historical price data (done)\n",
+    "    - Derive the historical price of the variance swap independently\n",
+    "\n",
+    "However the historical data of variance swap is hardly accessible, we will simply use the spread between realized varaince and implied variance as the price of the variance swap. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "class Asset_VS(Asset_IV):\n",
+    "    \n",
+    "    @lazy\n",
+    "    def VarianceSwapPx(self):\n",
+    "        return (self.HistoricalVol - self.ImpliedVol).rename('VarianceSwap')\n",
+    "    \n",
+    "    def plot(self):\n",
+    "        pd.concat([self.StockPx, self.VarianceSwapPx], 1).plot(figsize=(20, 10), secondary_y='StockPx')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "11f06e12ff50467393bc3c5344a29051",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "A Jupyter Widget"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/plain": [
+       "<function __main__.<lambda>>"
+      ]
+     },
+     "execution_count": 10,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "interact(lambda ticker=UNIVERSE: Asset_VS(Ticker=ticker).plot())"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 7. Testing for Mean Reversion / Identifying Underlyings"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Now we would expect the Variance Swap price to be a mean-reverting time series, and our volatility arbitrage problem has been reduced to a normal statistical arbitrage problem. \n",
+    "\n",
+    "A continuous mean-reverting time series can be represented by an Ornstein-Uhlenbeck stochastic differential equation:\n",
+    "\n",
+    "$$ dx_t = \\theta(\\mu - x_t)dt + \\sigma dW_t $$\n",
+    "\n",
+    "Where $\\theta$ is the rate of reversion to the mean, $\\mu$ is the mean value of the process, $\\sigma$ is the variance of the process and $W_t$ is a Wiener Process or Brownian Motion.\n",
+    "\n",
+    "In a discrete setting the equation states that the change of the price series in the next time period is proportional to the difference between the mean price and the current price, with the addition of Gaussian noise.\n",
+    "\n",
+    "This property motivates the Augmented Dickey-Fuller Test, which we will use below.\n",
+    "\n",
+    "##### Augmented Dickey-Fuller (ADF) Test\n",
+    "\n",
+    "Mathematically, the ADF is based on the idea of testing for the presence of a unit root in an autoregressive time series sample. It makes use of the fact that if a price series possesses mean reversion, then the next price level will be proportional to the current price level. A linear lag model of order pp is used for the time series:\n",
+    "\n",
+    "$$\n",
+    "\\Delta y_t = \\alpha + \\beta t + \\gamma y_{t-1} + \\delta_1 \\Delta y_{t-1} + \\dots + \\delta \\Delta y_{y-p+1} + \\epsilon_t\n",
+    "$$\n",
+    "\n",
+    "Where $\\alpha$ is a constant, $\\beta$ represents the coefficient of a temporal trend and $\\Delta yt=y(t)−y(t−1)$. The role of the ADF hypothesis test is to consider the null hypothesis that $\\gamma=0$, which would indicate that the process is a random walk and thus non mean reverting. If the hypothesis that $\\gamma=0$ can be rejected then the following movement of the price series is proportional to the current price and thus it is unlikely to be a random walk."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "c599f2ab78b64cec879a366bc18436f0",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "A Jupyter Widget"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/plain": [
+       "<function __main__.<lambda>>"
+      ]
+     },
+     "execution_count": 11,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "class Asset_ADF(Asset_VS):\n",
+    "    \n",
+    "    @lazy\n",
+    "    def ADFTest(self):\n",
+    "        return ts.adfuller(self.VarianceSwapPx, 1)\n",
+    "    \n",
+    "interact(lambda ticker=UNIVERSE: Asset_ADF(Ticker=ticker).ADFTest)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Here is the output of the Augmented Dickey-Fuller test for Variance Swap over last 60 days period. The first value is the calculated test-statistic, while the second value is the p-value. The fourth is the number of data points in the sample. The fifth value, the dictionary, contains the critical values of the test-statistic at the 1, 5 and 10 percent values respectively.\n",
+    "\n",
+    "Since the calculated value of the test statistic is smaller than any of the critical values at the 1, 5 or 10 percent levels, we can reject the null hypothesis of $\\gamma=0$ and thus **we are likely to have found a mean reverting time series**.\n",
+    "\n",
+    "If you compare the test statistic of *AAPL* and *MSFT*, you would be able to find *AAPL*'s is smaller than *MSFT*'s, which implies *AAPL*'s variance swap price follows mean-reverting property better than *MSFT*, and we should consider trade it preferrably.\n",
+    "\n",
+    "The universe above includes 3 securities. Obviously there are more than 3 equities on the exchange. This function can be run on any universe (approximately 3000 equities). It allows us to get all stock's variance swap ADF test statistic, this is a good metric for quickly searching/selecting for all stocks with better mean-reverting property. For the purposes of this notebook/not spending money on Quandl yet, I will focus on only a small subset."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "###  8. Entry and Exit Signals\n",
+    "\n",
+    "So far we have identified mean-reverting variance swaps, and build a model to show us overvalued, and undervalues options relative to forecasted realized vol. Now, the most important part, is how can we trade on this. \n",
+    "\n",
+    "The recommended way to trade this is define a threshold that, if our variance swap plot breaks out of, you should enter. Remember, if the larger the residual, the more overvalued realized vol is to implied vol. So if your residuals chart moves above your threshold, you would want to short variance swap. Likewise, if the residuals moved below your threshold, implied vol would be overvalued relative to realized vol. In this case, you would want to long variance swap to capture the re-convergence.\n",
+    "\n",
+    "Coming up with the threshold is difficult and may vary based on the types of underlying asset we are trading. Our goal is to capture the most profitable time to enter a trade. Below is an example of one way to identify potential break out points. I have places grid lines for standard deviation markers. This is a was to quantify how much of an outlier a specific move is. The further away from the mean (the more standard deviations), the more likely we are experiencing a divergence."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "7b8e64c35157466d977e30a82f8239c9",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "A Jupyter Widget"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/plain": [
+       "<function __main__.<lambda>>"
+      ]
+     },
+     "execution_count": 12,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "class Asset(Asset_ADF):\n",
+    "    \n",
+    "    def plot(self):\n",
+    "        residuals = self.VarianceSwapPx\n",
+    "        \n",
+    "        plt.figure(figsize=(20,10))\n",
+    "        plt.plot(residuals.index, residuals.values, c = 'red')\n",
+    "\n",
+    "        res_mean = residuals.values.mean()\n",
+    "        res_std = residuals.values.std()\n",
+    "\n",
+    "        #Apply the standard deviation filter on top of the residuals chart\n",
+    "        #comment out if you dont want the residuals\n",
+    "        plt.plot(residuals.index, np.full((len(residuals), 1), res_mean), c = '#1E293D', linestyle = '--', label = 'Mean (%.3f)' % residuals.mean())\n",
+    "        plt.plot(residuals.index, np.full((len(residuals), 1), res_mean + .5*res_std), c = '#445E76', linestyle = '--', label = 'Mean (%.3f)' % residuals.mean())\n",
+    "        plt.plot(residuals.index, np.full((len(residuals), 1), res_mean - .5*res_std), c = '#445E76', linestyle = '--', label = 'Mean (%.3f)' % residuals.mean())\n",
+    "        plt.plot(residuals.index, np.full((len(residuals), 1), res_mean + res_std), c = '#7498B7', linestyle = '--', label = 'Mean (%.3f)' % residuals.mean())\n",
+    "        plt.plot(residuals.index, np.full((len(residuals), 1), res_mean - res_std), c = '#7498B7', linestyle = '--', label = 'Mean (%.3f)' % residuals.mean())\n",
+    "        plt.plot(residuals.index, np.full((len(residuals), 1), res_mean + 1.5*res_std), c = '#B1CCE0', linestyle = '--', label = 'Mean (%.3f)' % residuals.mean())\n",
+    "        plt.plot(residuals.index, np.full((len(residuals), 1), res_mean - 1.5*res_std), c = '#B1CCE0', linestyle = '--', label = 'Mean (%.3f)' % residuals.mean())\n",
+    "\n",
+    "        offset_y_frac = 0.012\n",
+    "        offset_y = 0.01\n",
+    "\n",
+    "        plt.text(736342, res_mean - offset_y, \"$\\mu$\")\n",
+    "        plt.text(736342, res_mean + 0.5*res_std - offset_y_frac, '$\\\\frac{1}{2} \\sigma$')\n",
+    "        plt.text(736342, res_mean - 0.5*res_std - offset_y_frac, '$\\\\frac{1}{2} \\sigma$')\n",
+    "        plt.text(736342, res_mean + res_std - offset_y, '$\\sigma$')\n",
+    "        plt.text(736342, res_mean - res_std - offset_y, '$\\sigma$')\n",
+    "        plt.text(736342, res_mean + 1.5*res_std - offset_y_frac, '$\\\\frac{3}{2} \\sigma$')\n",
+    "        plt.text(736342, res_mean - 1.5*res_std - offset_y_frac, '$\\\\frac{3}{2} \\sigma$')\n",
+    "        ##END STD OVERLAY\n",
+    "\n",
+    "        plt.xlabel('Date')\n",
+    "        plt.ylabel('$S_t$')\n",
+    "        \n",
+    "        plt.show()\n",
+    "    \n",
+    "interact(lambda ticker=UNIVERSE: Asset(Ticker=ticker).plot())"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "This gives us one possible approach to finding buy and sell points. Look for residual charts who are more than 1.5 standard deviations away from the mean. Because we are assuming a mean reverting processes, the further away the residuals get, the more likely they are to converge. To definitively calibratethe threshold entering and exiting, we will need event study and back testing."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 9. Further steps\n",
+    "\n",
+    "- To-do List\n",
+    "\n",
+    "    - Event study: based on given threshold to enter/exit, we are able to describe market events, then observe, **statistically, how events affect future prices**. We will build a event profiler scans over historical data for divergence event and then calculates the impact of that event on the variance swap prices in the past and the future over a certain window. (http://wiki.quantsoftware.org/index.php?title=Event_Profiler)\n",
+    "\n",
+    "    - Simulation: according to Event study's result (on training data) we can decide the threshold, next step is to use defined entry/exit event to run a backtest, to figure out its **returns, Sharpe ratio and other risk measures**\n",
+    "    \n",
+    "    - In-sample/Out-of-sample seperation: event study and simulation should fall on different periods, as event study is like training model while simulation is testing model, in order to avoid overfitting, we should always remember to seperate dataset; also the last plot has **mean+std** thresholds added, note we can't use them to decide threshold and run simulation, as we were using future data to plot such thresholds lines, ideally we should plot **rolling mean + rolling std** instead.\n",
+    "    \n",
+    "    \n",
+    "    \n",
+    "- Can be improved but will have technical difficulties\n",
+    "\n",
+    "    - Universe explansion: we should expand the universe to all potential equities, or even other products (rates, FX, commodity), then **select underlyings with good historical mean-reverting behavior**; the difficulty would be time-consuming, and we should definitely do this in parallel while my personal machine wouldn't work.\n",
+    "    \n",
+    "    - Machine learning in Event Study: event study is not only for calibration threshold of entry/exit, but also considering other market features which may potentially differentiate similar events while different future behavior; however this will require a built-in large **features database**, which generally is alraedy existing in industry companies."
+   ]
+  }
+ ],
+ "metadata": {
+  "anaconda-cloud": {},
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
